@@ -1,0 +1,24 @@
+#!/usr/bin/env python3
+"""
+slurm-local: A CLI tool to spin up a local Docker-based SLURM cluster for testing.
+
+Usage:
+    slurm-local up [--nodes N] [--cluster-name NAME]
+    slurm-local down [--cluster-name NAME]
+    slurm-local status [--cluster-name NAME]
+    slurm-local submit [--cluster-name NAME] [--job JOBNAME]
+    slurm-local shell [--cluster-name NAME]
+    slurm-local logs [--cluster-name NAME] [--node NODE]
+    slurm-local build
+"""
+
+import sys
+import os
+
+# Ensure package is importable when run directly
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from slurm_cluster.cli import main
+
+if __name__ == "__main__":
+    main()
