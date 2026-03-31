@@ -254,17 +254,24 @@ chmod 644 /etc/slurm/slurm.conf /etc/slurm/cgroup.conf
                     return False
 
                 try:
+                    # %n (lowercase) emits one line per node, making it easy to count.
                     result = self._exec_on_controller(
-                        "sinfo --noheader -o '%N %T' 2>/dev/null", raise_on_error=False
+                        "sinfo --noheader -o '%n %T' 2>/dev/null", raise_on_error=False
                     )
-                    if result and "idle" in result:
-                        sp.stop()
-                        print_success("Cluster is ready!")
-                        return True
-                    # Nodes registered but stuck in down/drain — nudge them.
-                    if result and not _resume_attempted:
+                    if result:
+                        idle_count = sum(
+                            1 for line in result.splitlines()
+                            if line.strip() and line.strip().split()[-1] == "idle"
+                        )
+                        if idle_count >= self.num_workers:
+                            sp.stop()
+                            print_success("Cluster is ready!")
+                            return True
+                    # Not all nodes idle yet — nudge any that are down/drain/unknown.
+                    if not _resume_attempted:
+                        node_list = ",".join(f"worker{i+1}" for i in range(self.num_workers))
                         self._exec_on_controller(
-                            "scontrol update NodeName=ALL State=RESUME 2>/dev/null || true",
+                            f"scontrol update NodeName={node_list} State=RESUME 2>/dev/null || true",
                             raise_on_error=False,
                         )
                         _resume_attempted = True

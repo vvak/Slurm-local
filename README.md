@@ -9,12 +9,13 @@ A Python CLI tool that spins up a fully functional **local SLURM cluster** insid
 - **One command startup** — `slurm-local up` builds the image and launches the cluster
 - **Configurable worker nodes** — spin up 1–N worker nodes
 - **Auto-generated `slurm.conf`** — sensible defaults, ready to customise
-- **5 sample workloads** included:
+- **6 sample workloads** included:
   - `hello` — simple single-task job
   - `array` — job array (5 tasks)
   - `sleep` — long-running job (good for testing `squeue`/`scancel`)
   - `resource` — multi-task job spread across nodes
   - `deps` — job dependency chain (B waits for A)
+  - `multinode` — 5-phase parallel job across all workers using `srun`
 - **Interactive shell** — `slurm-local shell` drops you into the controller
 - **Live logs** — `slurm-local logs` tails container output
 
@@ -90,8 +91,31 @@ slurm-local down
 | `sleep` | Runs for 5 minutes — good for `squeue`/`scancel` testing |
 | `resource` | Requests 4 tasks, uses `srun` to print node names |
 | `deps` | Submits two jobs where B depends on A (`--dependency=afterok`) |
+| `multinode` | 5-phase parallel job across all worker nodes (~3 min) |
 
 Output files are written to `/shared/` inside the cluster (a Docker volume shared across all nodes).
+
+### `multinode` — Phase breakdown
+
+Runs 4 tasks across 2 nodes (2 per node) using `srun`. All output lands in `/shared/multinode_<jobid>/`.
+
+| Phase | What it tests |
+|---|---|
+| 1 — Discovery | `srun` task placement; each task reports its node, local ID, and PID |
+| 2 — CPU work | Each task runs a Sieve of Eratosthenes over `[2, 2,000,000]` in parallel — verifiable result (148,933 primes per task) |
+| 3 — Barrier | Tasks write tokens to the shared volume; controller waits until all are present before continuing |
+| 4 — Aggregation | Single-process collection and reporting from per-task output files |
+| 5 — Parallel I/O | Each task writes 8 MB to the shared volume simultaneously, reporting throughput |
+
+```bash
+slurm-local submit --job multinode
+
+# Inspect results after it finishes:
+slurm-local shell
+ls /shared/multinode_*/
+cat /shared/multinode_*/phase4_report.txt
+cat /shared/multinode_*/phase5_io.txt
+```
 
 ---
 

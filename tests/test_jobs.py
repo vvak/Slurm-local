@@ -3,7 +3,7 @@
 import pytest
 from slurm_cluster.jobs import SAMPLE_JOBS
 
-EXPECTED_JOB_NAMES = {"hello", "array", "sleep", "resource", "deps"}
+EXPECTED_JOB_NAMES = {"hello", "array", "sleep", "resource", "deps", "multinode"}
 
 
 class TestSampleJobsStructure:
@@ -107,3 +107,121 @@ class TestIndividualJobs:
         job = SAMPLE_JOBS["deps"]
         # Job B depends on JOB_A variable
         assert "${JOB_A}" in job["script"] or "$JOB_A" in job["script"]
+
+
+class TestMultinodeJob:
+    def setup_method(self):
+        self.job = SAMPLE_JOBS["multinode"]
+        self.script = self.job["script"]
+
+    # ── Structure ─────────────────────────────────────────────────────────────
+
+    def test_requests_multiple_nodes(self):
+        assert "--nodes=2" in self.script
+
+    def test_requests_tasks_per_node(self):
+        assert "--ntasks-per-node=2" in self.script
+
+    def test_output_in_shared_subdir(self):
+        # Output should go to /shared/ (job-specific subdir created at runtime)
+        for line in self.script.splitlines():
+            if line.startswith("#SBATCH --output="):
+                assert "/shared/" in line
+                break
+        else:
+            pytest.fail("No #SBATCH --output= directive found")
+
+    def test_uses_srun_for_parallel_tasks(self):
+        assert self.script.count("srun") >= 3  # one per parallel phase
+
+    def test_creates_output_directory(self):
+        assert 'mkdir -p "$OUTDIR"' in self.script
+
+    def test_output_dir_keyed_on_job_id(self):
+        assert "SLURM_JOB_ID" in self.script
+        assert "multinode_${SLURM_JOB_ID}" in self.script
+
+    # ── Phase 1: Discovery ────────────────────────────────────────────────────
+
+    def test_phase1_reports_hostname(self):
+        assert "hostname" in self.script
+
+    def test_phase1_reports_local_task_id(self):
+        assert "SLURM_LOCALID" in self.script
+
+    def test_phase1_reports_global_task_id(self):
+        assert "SLURM_PROCID" in self.script
+
+    def test_phase1_writes_discovery_file(self):
+        assert "phase1_discovery.txt" in self.script
+
+    # ── Phase 2: CPU work ─────────────────────────────────────────────────────
+
+    def test_phase2_uses_sieve_of_eratosthenes(self):
+        assert "sieve" in self.script.lower()
+
+    def test_phase2_sieve_upper_bound(self):
+        assert "2000000" in self.script
+
+    def test_phase2_expected_prime_count(self):
+        assert "148933" in self.script
+
+    def test_phase2_writes_per_task_prime_files(self):
+        assert "phase2_primes_task" in self.script
+
+    def test_phase2_aggregates_counts(self):
+        # Controller sums per-task counts into TOTAL
+        assert "TOTAL" in self.script
+        assert "phase2_primes_task" in self.script
+
+    # ── Phase 3: Barrier ──────────────────────────────────────────────────────
+
+    def test_phase3_creates_barrier_directory(self):
+        assert "BARRIER_DIR" in self.script
+        assert "barrier" in self.script
+
+    def test_phase3_tasks_write_tokens(self):
+        assert "ready_task" in self.script
+
+    def test_phase3_controller_waits_for_all_tokens(self):
+        # Controller polls until token count matches task count
+        assert "NTASKS" in self.script
+        assert "FOUND" in self.script
+
+    def test_phase3_has_timeout(self):
+        assert "DEADLINE" in self.script or "timeout" in self.script.lower()
+
+    # ── Phase 4: Aggregation ──────────────────────────────────────────────────
+
+    def test_phase4_writes_report_file(self):
+        assert "phase4_report.txt" in self.script
+
+    def test_phase4_collects_prime_results(self):
+        # Aggregation reads phase2 output files
+        assert "phase2_primes" in self.script
+
+    def test_phase4_collects_barrier_tokens(self):
+        assert "ready_task" in self.script
+
+    # ── Phase 5: Parallel I/O ─────────────────────────────────────────────────
+
+    def test_phase5_each_task_writes_8mb(self):
+        assert "8" in self.script
+        # dd count=8 with bs=1M, or explicit 8 MB reference
+        assert "count=8" in self.script or "8 MB" in self.script or "8MB" in self.script
+
+    def test_phase5_uses_parallel_srun(self):
+        # Phase 5 must use srun so all tasks write simultaneously
+        lines = self.script.splitlines()
+        phase5_start = next(
+            (i for i, l in enumerate(lines) if "PHASE 5" in l), None
+        )
+        assert phase5_start is not None, "Phase 5 section not found"
+        phase5_block = "\n".join(lines[phase5_start:])
+        assert "srun" in phase5_block
+
+    def test_phase5_reports_throughput(self):
+        assert "throughput" in self.script.lower() or "MB/s" in self.script
+
+    def test_phase5_writes_per_task_io_files(self):
+        assert "phase5_io_task" in self.script

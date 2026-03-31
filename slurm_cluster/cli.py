@@ -95,7 +95,7 @@ Examples:
     p_submit.add_argument(
         "--job",
         default="all",
-        choices=["all", "hello", "array", "deps", "resource", "sleep"],
+        choices=["all", "hello", "array", "deps", "multinode", "resource", "sleep"],
         help="Which sample job to submit (default: all)",
     )
     p_submit.set_defaults(func=cmd_submit)

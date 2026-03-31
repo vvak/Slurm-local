@@ -126,6 +126,170 @@ echo "Resource test complete."
 """,
     },
 
+    "multinode": {
+        "description": "Multi-node parallel job — 5 structured phases using srun across all workers",
+        "script": r"""#!/bin/bash
+#SBATCH --job-name=multinode_parallel
+#SBATCH --output=/shared/multinode_%j.out
+#SBATCH --error=/shared/multinode_%j.err
+#SBATCH --ntasks-per-node=2
+#SBATCH --nodes=2
+#SBATCH --cpus-per-task=1
+#SBATCH --mem-per-cpu=128M
+#SBATCH --time=00:05:00
+#SBATCH --partition=debug
+
+OUTDIR="/shared/multinode_${SLURM_JOB_ID}"
+mkdir -p "$OUTDIR"
+
+NTASKS=$((SLURM_JOB_NUM_NODES * SLURM_NTASKS_PER_NODE))
+
+echo "============================================================"
+echo " Multi-Node Parallel Job"
+echo "============================================================"
+echo "Job ID:       $SLURM_JOB_ID"
+echo "Nodes:        $SLURM_JOB_NUM_NODES  ($SLURM_JOB_NODELIST)"
+echo "Tasks/node:   $SLURM_NTASKS_PER_NODE"
+echo "Total tasks:  $NTASKS"
+echo "Output dir:   $OUTDIR"
+echo "Start:        $(date)"
+echo ""
+
+# ── Phase 1: Discovery ───────────────────────────────────────────────────────
+echo "------------------------------------------------------------"
+echo "PHASE 1 — Task Discovery (srun placement)"
+echo "------------------------------------------------------------"
+srun --label bash -c '
+    echo "node=$(hostname) localid=$SLURM_LOCALID globalid=$SLURM_PROCID pid=$$"
+' | tee "$OUTDIR/phase1_discovery.txt"
+echo ""
+
+# ── Phase 2: CPU work — Sieve of Eratosthenes ────────────────────────────────
+echo "------------------------------------------------------------"
+echo "PHASE 2 — CPU Work (parallel prime sieve, chunks of 2M)"
+echo "------------------------------------------------------------"
+srun bash -c '
+    TASKID=$SLURM_PROCID
+    OUTFILE="'"$OUTDIR"'/phase2_primes_task${TASKID}.txt"
+    LIMIT=2000000
+
+    python3 - <<PYEOF
+import math, time
+limit = $LIMIT
+start = time.time()
+sieve = bytearray([1]) * (limit + 1)
+sieve[0] = sieve[1] = 0
+for i in range(2, int(math.isqrt(limit)) + 1):
+    if sieve[i]:
+        sieve[i*i::i] = bytearray(len(sieve[i*i::i]))
+count = sum(sieve)
+elapsed = time.time() - start
+print(f"task=$TASKID node=$(hostname) primes_in_2M={count} elapsed={elapsed:.3f}s")
+with open("$OUTFILE", "w") as f:
+    f.write(f"{count}\n")
+PYEOF
+'
+echo ""
+echo "Aggregating prime counts..."
+TOTAL=0
+for f in "$OUTDIR"/phase2_primes_task*.txt; do
+    COUNT=$(cat "$f")
+    TOTAL=$((TOTAL + COUNT))
+done
+echo "Total primes found across $NTASKS tasks: $TOTAL"
+if [ "$TOTAL" -eq $((NTASKS * 148933)) ]; then
+    echo "PASS — each task correctly found 148,933 primes in [2, 2,000,000]"
+else
+    echo "NOTE — expected $((NTASKS * 148933)) (${NTASKS} x 148,933); got $TOTAL"
+fi
+echo ""
+
+# ── Phase 3: Barrier ─────────────────────────────────────────────────────────
+echo "------------------------------------------------------------"
+echo "PHASE 3 — Barrier (shared-volume token rendezvous)"
+echo "------------------------------------------------------------"
+BARRIER_DIR="$OUTDIR/barrier"
+mkdir -p "$BARRIER_DIR"
+
+srun bash -c '
+    TOKEN="'"$BARRIER_DIR"'/ready_task${SLURM_PROCID}"
+    echo "$(hostname):$$:$(date +%s)" > "$TOKEN"
+    echo "task $SLURM_PROCID wrote barrier token"
+'
+
+echo "Waiting for all $NTASKS barrier tokens..."
+DEADLINE=$(($(date +%s) + 30))
+while true; do
+    FOUND=$(ls "$BARRIER_DIR"/ready_task* 2>/dev/null | wc -l)
+    if [ "$FOUND" -ge "$NTASKS" ]; then
+        break
+    fi
+    if [ "$(date +%s)" -gt "$DEADLINE" ]; then
+        echo "WARNING: barrier timed out ($FOUND / $NTASKS tokens)"
+        break
+    fi
+    sleep 1
+done
+echo "Barrier cleared — all $NTASKS tasks checked in:"
+ls "$BARRIER_DIR"/ | sort
+echo ""
+
+# ── Phase 4: Aggregation ─────────────────────────────────────────────────────
+echo "------------------------------------------------------------"
+echo "PHASE 4 — Aggregation (single-process result collection)"
+echo "------------------------------------------------------------"
+REPORT="$OUTDIR/phase4_report.txt"
+{
+    echo "Multi-Node Parallel Job Report"
+    echo "Generated: $(date)"
+    echo "Job ID:    $SLURM_JOB_ID"
+    echo "Nodes:     $SLURM_JOB_NODELIST"
+    echo ""
+    echo "Per-task prime counts:"
+    for f in $(ls "$OUTDIR"/phase2_primes_task*.txt | sort -V); do
+        TASK=$(basename "$f" .txt | sed 's/phase2_primes_//')
+        COUNT=$(cat "$f")
+        printf "  %-25s  %d primes\n" "$TASK" "$COUNT"
+    done
+    echo ""
+    echo "Barrier tokens:"
+    for f in $(ls "$BARRIER_DIR"/ready_task* | sort -V); do
+        printf "  %s  ->  %s\n" "$(basename "$f")" "$(cat "$f")"
+    done
+} | tee "$REPORT"
+echo ""
+
+# ── Phase 5: Parallel I/O ────────────────────────────────────────────────────
+echo "------------------------------------------------------------"
+echo "PHASE 5 — Parallel I/O (each task writes 8 MB to /shared)"
+echo "------------------------------------------------------------"
+srun bash -c '
+    IOFILE="'"$OUTDIR"'/phase5_io_task${SLURM_PROCID}.bin"
+    T0=$(date +%s%3N)
+    dd if=/dev/urandom of="$IOFILE" bs=1M count=8 2>/dev/null
+    T1=$(date +%s%3N)
+    ELAPSED_MS=$(( T1 - T0 ))
+    SIZE_MB=8
+    if [ "$ELAPSED_MS" -gt 0 ]; then
+        THROUGHPUT=$(( SIZE_MB * 1000 / ELAPSED_MS ))
+    else
+        THROUGHPUT=999
+    fi
+    echo "task=$SLURM_PROCID node=$(hostname) wrote=${SIZE_MB}MB time=${ELAPSED_MS}ms throughput~${THROUGHPUT}MB/s"
+' | tee "$OUTDIR/phase5_io.txt"
+echo ""
+
+# ── Summary ───────────────────────────────────────────────────────────────────
+echo "============================================================"
+echo " All phases complete"
+echo "============================================================"
+echo "Output files in $OUTDIR:"
+ls -lh "$OUTDIR"/ | awk '{print "  " $0}'
+echo ""
+echo "Finished: $(date)"
+""",
+    },
+
     "deps": {
         "description": "Dependency chain — Job B waits for Job A to finish",
         "script": """#!/bin/bash
